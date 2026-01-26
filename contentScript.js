@@ -16,6 +16,296 @@ function error(...args) {
 // Cache the scrollable element once found
 let cachedScrollableElement = null;
 
+// ============================================================================
+// SITE HANDLERS - Special handling for specific websites
+// ============================================================================
+
+/**
+ * Jira Site Handler
+ * Detects Jira Server, Data Center, and Cloud instances and handles their unique scroll behavior
+ */
+const JiraHandler = {
+  name: 'Jira',
+
+  /**
+   * Detect if the current page is a Jira issue page
+   * Works for Server, Data Center, and Cloud
+   */
+  detect() {
+    // Method 1: Jira Cloud - ALWAYS hosted on *.atlassian.net
+    const isJiraCloud = (
+      window.location.hostname.endsWith('.atlassian.net') &&
+      window.location.pathname.match(/\/browse\/[A-Z]+-\d+/)
+    );
+
+    if (isJiraCloud) {
+      return { type: 'jira-cloud', detected: true };
+    }
+
+    // Method 2: Jira Server/Data Center - self-hosted, detect by DOM
+    const isJiraServer = !!(
+      document.getElementById('issue-content') &&
+      document.querySelector('.issue-view') &&
+      document.querySelector('.aui-page-panel')
+    );
+
+    if (isJiraServer) {
+      return { type: 'jira-server', detected: true };
+    }
+
+    // Method 3: Fallback - check for Jira markers (meta tags, globals)
+    const hasJiraMeta = !!(
+      document.querySelector('meta[name="application-name"][content*="JIRA"]') ||
+      document.querySelector('meta[name="application-name"][content*="Jira"]') ||
+      window.JIRA ||
+      window.AJS?.Meta?.get('issue-key')
+    );
+
+    if (hasJiraMeta) {
+      return { type: 'jira-unknown', detected: true };
+    }
+
+    return { detected: false };
+  },
+
+  /**
+   * Find the scroll container for Jira pages
+   */
+  findScrollContainer() {
+    const detection = this.detect();
+
+    if (!detection.detected) {
+      return null;
+    }
+
+    log(`Jira detected: ${detection.type}`);
+
+    if (detection.type === 'jira-server') {
+      return this.findServerScrollContainer();
+    }
+
+    if (detection.type === 'jira-cloud') {
+      return this.findCloudScrollContainer();
+    }
+
+    // For unknown Jira type, try both methods
+    return this.findServerScrollContainer() || this.findCloudScrollContainer();
+  },
+
+  /**
+   * Find scroll container for Jira Server/Data Center
+   * The .issue-view element has inline height and overflow:auto
+   */
+  findServerScrollContainer() {
+    const issueView = document.querySelector('.issue-view');
+
+    if (!issueView) {
+      return null;
+    }
+
+    const style = getComputedStyle(issueView);
+    const hasOverflow = style.overflowY === 'auto' || style.overflowY === 'scroll';
+    const canScroll = issueView.scrollHeight > issueView.clientHeight + 10;
+
+    if (hasOverflow && canScroll) {
+      log('Found Jira Server scroll container: .issue-view', {
+        scrollHeight: issueView.scrollHeight,
+        clientHeight: issueView.clientHeight
+      });
+      return issueView;
+    }
+
+    return null;
+  },
+
+  /**
+   * Find scroll container for Jira Cloud
+   * Cloud uses React and has different scroll structure
+   */
+  findCloudScrollContainer() {
+    // Jira Cloud potential scroll containers
+    const selectors = [
+      '[data-testid="issue.views.issue-base.foundation.issue-panel"]',
+      '[data-testid="issue-view-scrollable-container"]',
+      '[data-testid="issue.views.issue-base.foundation.content"]',
+      '[role="main"]'
+    ];
+
+    for (const selector of selectors) {
+      const elements = document.querySelectorAll(selector);
+
+      for (const el of elements) {
+        const style = getComputedStyle(el);
+        const hasOverflow = style.overflowY === 'auto' || style.overflowY === 'scroll';
+        const canScroll = el.scrollHeight > el.clientHeight + 10;
+
+        if (hasOverflow && canScroll) {
+          log(`Found Jira Cloud scroll container: ${selector}`, {
+            scrollHeight: el.scrollHeight,
+            clientHeight: el.clientHeight
+          });
+          return el;
+        }
+      }
+    }
+
+    // Fallback: find largest scrollable element on the page
+    return this.findLargestScrollable();
+  },
+
+  /**
+   * Fallback: find the largest scrollable element
+   */
+  findLargestScrollable() {
+    let bestMatch = null;
+    let bestScrollHeight = 0;
+
+    const allElements = document.querySelectorAll('*');
+
+    for (const el of allElements) {
+      if (el.offsetWidth < 200 || el.offsetHeight < 200) continue;
+
+      const style = getComputedStyle(el);
+      const hasOverflow = style.overflowY === 'auto' || style.overflowY === 'scroll';
+      const canScroll = el.scrollHeight > el.clientHeight + 50;
+
+      if (hasOverflow && canScroll && el.scrollHeight > bestScrollHeight) {
+        bestScrollHeight = el.scrollHeight;
+        bestMatch = el;
+      }
+    }
+
+    if (bestMatch) {
+      log('Found Jira fallback scroll container', {
+        tag: bestMatch.tagName,
+        id: bestMatch.id,
+        scrollHeight: bestMatch.scrollHeight
+      });
+    }
+
+    return bestMatch;
+  },
+
+  /**
+   * Get the center content bounds for Jira pages (for center-only capture)
+   */
+  getCenterBounds() {
+    const detection = this.detect();
+
+    if (detection.type === 'jira-server') {
+      return this.getServerCenterBounds();
+    }
+
+    if (detection.type === 'jira-cloud') {
+      return this.getCloudCenterBounds();
+    }
+
+    return null;
+  },
+
+  /**
+   * Get center bounds for Jira Server/Data Center
+   */
+  getServerCenterBounds() {
+    // Try multiple selectors for the left sidebar
+    // .aui-sidebar-wrapper is the full navigation panel
+    // .aui-sidebar is just an inner element that may have 0 height
+    const sidebarWrapper = document.querySelector('.aui-sidebar-wrapper');
+    const leftSidebar = document.querySelector('.aui-sidebar');
+    const rightSidebar = document.getElementById('viewissuesidebar');
+    const issueView = document.querySelector('.issue-view');
+
+    if (!issueView) return null;
+
+    const viewRect = issueView.getBoundingClientRect();
+
+    // Use the sidebar wrapper if available (more reliable), otherwise fall back to .aui-sidebar
+    // If neither, use the issueView's left edge
+    let leftBound = viewRect.left; // Default to issueView left
+    if (sidebarWrapper) {
+      const wrapperRect = sidebarWrapper.getBoundingClientRect();
+      if (wrapperRect.width > 0) {
+        leftBound = wrapperRect.right;
+      }
+    } else if (leftSidebar) {
+      const sidebarRect = leftSidebar.getBoundingClientRect();
+      if (sidebarRect.width > 0 && sidebarRect.height > 0) {
+        leftBound = sidebarRect.right;
+      }
+    }
+
+    const rightBound = rightSidebar ? rightSidebar.getBoundingClientRect().left : viewRect.right;
+
+    log('Jira center bounds calculation:', {
+      leftBound,
+      rightBound,
+      issueViewLeft: viewRect.left,
+      width: rightBound - leftBound
+    });
+
+    return {
+      left: Math.round(leftBound),
+      right: Math.round(rightBound),
+      top: Math.round(viewRect.top),
+      width: Math.round(rightBound - leftBound),
+      scrollHeight: issueView.scrollHeight,
+      clientHeight: issueView.clientHeight
+    };
+  },
+
+  /**
+   * Get center bounds for Jira Cloud
+   */
+  getCloudCenterBounds() {
+    const mainContent = document.querySelector('[data-testid="issue.views.issue-base.foundation.content"]') ||
+                        document.querySelector('[role="main"]');
+
+    if (!mainContent) return null;
+
+    const rect = mainContent.getBoundingClientRect();
+
+    return {
+      left: Math.round(rect.left),
+      right: Math.round(rect.right),
+      top: Math.round(rect.top),
+      width: Math.round(rect.width),
+      scrollHeight: mainContent.scrollHeight,
+      clientHeight: mainContent.clientHeight
+    };
+  }
+};
+
+/**
+ * Site Handler Registry
+ * Add new site handlers here to support more websites
+ */
+const SiteHandlers = [
+  JiraHandler
+  // Add more handlers here: ConfluenceHandler, ServiceNowHandler, etc.
+];
+
+/**
+ * Try to find a scroll container using site-specific handlers
+ * Returns the scroll container element or null if no handler matches
+ */
+function findSiteSpecificScrollContainer() {
+  for (const handler of SiteHandlers) {
+    const detection = handler.detect();
+    if (detection.detected) {
+      log(`Site handler matched: ${handler.name} (${detection.type})`);
+      const container = handler.findScrollContainer();
+      if (container) {
+        return container;
+      }
+    }
+  }
+  return null;
+}
+
+// ============================================================================
+// CORE SCROLL DETECTION
+// ============================================================================
+
 /**
  * Find the main scrollable element on the page
  * Returns window if the document itself is scrollable, otherwise finds the scrollable container
@@ -26,7 +316,14 @@ function findScrollableElement() {
     return cachedScrollableElement;
   }
 
-  // First, check if the main document is scrollable
+  // NEW: Check site-specific handlers first (Jira, etc.)
+  const siteSpecificContainer = findSiteSpecificScrollContainer();
+  if (siteSpecificContainer) {
+    cachedScrollableElement = siteSpecificContainer;
+    return siteSpecificContainer;
+  }
+
+  // Check if the main document is scrollable
   const docScrollable = document.documentElement.scrollHeight > document.documentElement.clientHeight + 10;
 
   if (docScrollable) {
@@ -267,6 +564,20 @@ function getPageDimensions() {
   // Determine if we're using a custom container
   const useCustomContainer = scrollable !== null;
 
+  // Get container bounds if using custom container
+  let containerBounds = null;
+  if (useCustomContainer && scrollable) {
+    const rect = scrollable.getBoundingClientRect();
+    containerBounds = {
+      left: rect.left,
+      top: rect.top,
+      right: rect.right,
+      bottom: rect.bottom,
+      width: rect.width,
+      height: rect.height
+    };
+  }
+
   return {
     scrollHeight: dims.scrollHeight,
     scrollWidth: dims.scrollWidth,
@@ -276,7 +587,10 @@ function getPageDimensions() {
     currentScrollX: dims.scrollLeft,
     devicePixelRatio: window.devicePixelRatio || 1,
     useCustomContainer: useCustomContainer,
-    containerSelector: useCustomContainer ? describeElement(scrollable) : null
+    containerSelector: useCustomContainer ? describeElement(scrollable) : null,
+    containerBounds: containerBounds,
+    windowHeight: window.innerHeight,
+    windowWidth: window.innerWidth
   };
 }
 
@@ -388,7 +702,9 @@ function findFixedElements() {
 
   for (const el of all) {
     // Skip our own overlay elements
-    if (el.id && el.id.startsWith('longshot-')) continue;
+    // Note: el.id can be an SVGAnimatedString for SVG elements, so convert to string first
+    const elId = typeof el.id === 'string' ? el.id : (el.id?.baseVal || '');
+    if (elId && elId.startsWith('longshot-')) continue;
     if (seen.has(el)) continue;
 
     const style = getComputedStyle(el);
@@ -803,6 +1119,102 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ success: true });
     } catch (e) {
       error('Failed to restore fixed elements:', e);
+      sendResponse({ success: false, error: e.message });
+    }
+    return true;
+  }
+
+  // JIRA_CENTER_CAPTURE_INIT: Initialize center-section capture for Jira pages
+  if (message.type === 'JIRA_CENTER_CAPTURE_INIT') {
+    log('Received JIRA_CENTER_CAPTURE_INIT request');
+    try {
+      const detection = JiraHandler.detect();
+      if (!detection.detected) {
+        sendResponse({ success: false, error: 'Not a Jira page' });
+        return true;
+      }
+
+      const centerBounds = JiraHandler.getCenterBounds();
+      if (!centerBounds) {
+        sendResponse({ success: false, error: 'Could not determine Jira center bounds' });
+        return true;
+      }
+
+      const scrollContainer = JiraHandler.findScrollContainer();
+      const scrollInfo = scrollContainer ? {
+        scrollHeight: scrollContainer.scrollHeight,
+        clientHeight: scrollContainer.clientHeight,
+        scrollTop: scrollContainer.scrollTop
+      } : {
+        scrollHeight: document.documentElement.scrollHeight,
+        clientHeight: window.innerHeight,
+        scrollTop: window.scrollY
+      };
+
+      const result = {
+        jiraType: detection.type,
+        centerBounds: centerBounds,
+        scrollInfo: scrollInfo,
+        devicePixelRatio: window.devicePixelRatio || 1,
+        viewportHeight: window.innerHeight,
+        viewportWidth: window.innerWidth,
+        hasScrollContainer: !!scrollContainer
+      };
+
+      log('Jira center capture init:', result);
+      sendResponse({ success: true, ...result });
+    } catch (e) {
+      error('Failed to initialize Jira center capture:', e);
+      sendResponse({ success: false, error: e.message });
+    }
+    return true;
+  }
+
+  // JIRA_CENTER_SCROLL_TO: Scroll Jira's scroll container for center capture
+  if (message.type === 'JIRA_CENTER_SCROLL_TO') {
+    const scrollY = message.y || 0;
+    log(`Received JIRA_CENTER_SCROLL_TO request: y=${scrollY}`);
+    try {
+      const scrollContainer = JiraHandler.findScrollContainer();
+
+      if (scrollContainer) {
+        scrollContainer.scrollTo(0, scrollY);
+      } else {
+        window.scrollTo(0, scrollY);
+      }
+
+      // Wait for scroll to settle
+      setTimeout(() => {
+        const actualScrollY = scrollContainer ? scrollContainer.scrollTop : window.scrollY;
+        log('Jira center scroll completed:', { scrolledToY: actualScrollY });
+        sendResponse({ success: true, scrolledToY: actualScrollY });
+      }, 150);
+    } catch (e) {
+      error('Failed to scroll Jira center:', e);
+      sendResponse({ success: false, error: e.message });
+    }
+    return true;
+  }
+
+  // DETECT_SITE_TYPE: Check if current page has a site-specific handler
+  if (message.type === 'DETECT_SITE_TYPE') {
+    log('Received DETECT_SITE_TYPE request');
+    try {
+      for (const handler of SiteHandlers) {
+        const detection = handler.detect();
+        if (detection.detected) {
+          sendResponse({
+            success: true,
+            detected: true,
+            siteType: handler.name,
+            detectionType: detection.type
+          });
+          return true;
+        }
+      }
+      sendResponse({ success: true, detected: false });
+    } catch (e) {
+      error('Failed to detect site type:', e);
       sendResponse({ success: false, error: e.message });
     }
     return true;

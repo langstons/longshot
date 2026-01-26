@@ -12,6 +12,7 @@ function log(...args) {
 // DOM elements
 let captureBtn;
 let regionCaptureBtn;
+let jiraCenterCaptureBtn;
 let toggleConfigBtn;
 let configPanel;
 let statusDiv;
@@ -47,6 +48,7 @@ async function initializePopup() {
   // Get DOM elements
   captureBtn = document.getElementById('captureBtn');
   regionCaptureBtn = document.getElementById('regionCaptureBtn');
+  jiraCenterCaptureBtn = document.getElementById('jiraCenterCaptureBtn');
   toggleConfigBtn = document.getElementById('toggleConfig');
   configPanel = document.getElementById('configPanel');
   statusDiv = document.getElementById('status');
@@ -61,12 +63,16 @@ async function initializePopup() {
   // Check current tab
   await checkCurrentTabUrl();
 
+  // Check for site-specific options (e.g., Jira)
+  await checkSiteSpecificOptions();
+
   // Check for active capture
   await checkActiveCaptureState();
 
   // Event listeners
   captureBtn.addEventListener('click', handleCapture);
   regionCaptureBtn.addEventListener('click', handleRegionCapture);
+  jiraCenterCaptureBtn.addEventListener('click', handleJiraCenterCapture);
   toggleConfigBtn.addEventListener('click', toggleConfigPanel);
   preCapture.addEventListener('change', saveConfig);
 
@@ -88,6 +94,38 @@ async function checkCurrentTabUrl() {
     }
   } catch (e) {
     log('Error checking tab URL:', e);
+  }
+}
+
+/**
+ * Check for site-specific capture options (e.g., Jira center capture)
+ */
+async function checkSiteSpecificOptions() {
+  try {
+    const response = await new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage({ type: 'DETECT_SITE_TYPE' }, (response) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+        } else {
+          resolve(response);
+        }
+      });
+    });
+
+    if (response && response.success && response.detected) {
+      log('Detected site type:', response.siteType, response.detectionType);
+
+      // Show Jira-specific button and hotkey hint for Jira pages
+      if (response.siteType === 'Jira') {
+        jiraCenterCaptureBtn.style.display = 'block';
+        const jiraHotkeyHint = document.getElementById('jiraHotkeyHint');
+        if (jiraHotkeyHint) {
+          jiraHotkeyHint.style.display = 'inline';
+        }
+      }
+    }
+  } catch (e) {
+    log('Error checking site type:', e);
   }
 }
 
@@ -242,6 +280,55 @@ async function handleRegionCapture() {
 }
 
 /**
+ * Handle Jira center capture button click
+ */
+async function handleJiraCenterCapture() {
+  log('Jira center capture requested');
+
+  errorMessage.classList.remove('show');
+  errorMessage.textContent = '';
+  jiraCenterCaptureBtn.disabled = true;
+  captureBtn.disabled = true;
+  regionCaptureBtn.disabled = true;
+  statusDiv.classList.add('show');
+  statusMessage.textContent = 'Starting Jira center capture...';
+  statusDiv.className = 'status show info';
+
+  try {
+    const response = await new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage(
+        { type: 'START_JIRA_CENTER_CAPTURE' },
+        (response) => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message));
+          } else if (!response) {
+            reject(new Error('No response from background'));
+          } else {
+            resolve(response);
+          }
+        }
+      );
+    });
+
+    if (!response.success) {
+      throw new Error(response.error || 'Jira center capture failed');
+    }
+
+    log('Jira center capture started:', response.sessionId);
+
+  } catch (error) {
+    log('Jira center capture error:', error);
+    statusDiv.className = 'status show error';
+    statusMessage.textContent = 'Capture failed!';
+    errorMessage.classList.add('show');
+    errorMessage.textContent = error.message;
+    jiraCenterCaptureBtn.disabled = false;
+    captureBtn.disabled = false;
+    regionCaptureBtn.disabled = false;
+  }
+}
+
+/**
  * Show capture status
  */
 function showCaptureStatus(status, message, progress) {
@@ -271,9 +358,13 @@ function showCaptureStatus(status, message, progress) {
   if (status === 'completed') {
     statusDiv.className = 'status show success';
     captureBtn.disabled = false;
+    regionCaptureBtn.disabled = false;
+    if (jiraCenterCaptureBtn) jiraCenterCaptureBtn.disabled = false;
   } else if (status === 'error') {
     statusDiv.className = 'status show error';
     captureBtn.disabled = false;
+    regionCaptureBtn.disabled = false;
+    if (jiraCenterCaptureBtn) jiraCenterCaptureBtn.disabled = false;
   } else {
     statusDiv.className = 'status show info';
   }

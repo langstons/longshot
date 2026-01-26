@@ -256,6 +256,10 @@
                 Capture Element
             </button>
 
+            <button class="button button-secondary" id="jiraCenterCaptureBtn" style="margin-top: 8px; display: none;">
+                Capture Jira Center
+            </button>
+
             <div class="error-message" id="errorMessage"></div>
             <div class="error-message" id="restrictedPageMessage">
                 Cannot capture browser internal pages. Please navigate to a regular website.
@@ -263,7 +267,8 @@
 
             <div class="hotkey-hint">
                 Full page: <kbd>Cmd+Shift+S</kbd> / <kbd>Ctrl+Shift+S</kbd><br>
-                Element: <kbd>Cmd+Shift+E</kbd> / <kbd>Ctrl+Shift+E</kbd>
+                Element: <kbd>Cmd+Shift+E</kbd> / <kbd>Ctrl+Shift+E</kbd><br>
+                <span id="jiraHotkeyHint" style="display: none;">Jira center: <kbd>Cmd+Shift+J</kbd> / <kbd>Ctrl+Shift+J</kbd></span>
             </div>
 
             <button class="toggle-config" id="toggleConfig">Options ▼</button>
@@ -277,7 +282,7 @@
         </div>
 
         <div class="footer">
-            Version 1.2.17
+            Version 1.3.6
         </div>
     </div>
 

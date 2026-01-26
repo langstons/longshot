@@ -136,6 +136,10 @@ async function scrollAndStitchCapture(tabId, sessionId) {
     const viewportWidth = dims.viewportWidth;
     const originalScrollY = dims.currentScrollY;
     const devicePixelRatio = dims.devicePixelRatio;
+    const useCustomContainer = dims.useCustomContainer;
+    const containerBounds = dims.containerBounds;
+    const windowHeight = dims.windowHeight || viewportHeight;
+    const windowWidth = dims.windowWidth || viewportWidth;
 
     // Configuration
     const OVERLAP_HEIGHT = 75; // 75px overlap between captures to avoid seams
@@ -159,14 +163,27 @@ async function scrollAndStitchCapture(tabId, sessionId) {
 
     // Step 2: Capture each viewport
     const captures = [];
+    const maxScrollY = scrollHeight - viewportHeight;
 
     for (let i = 0; i < numCaptures; i++) {
-      const scrollY = i * (viewportHeight - OVERLAP_HEIGHT);
+      let scrollY = i * (viewportHeight - OVERLAP_HEIGHT);
 
-      // Don't scroll past the bottom
-      if (scrollY > scrollHeight - viewportHeight) {
-        log(`Capture ${i + 1}: Would exceed page height, stopping`);
-        break;
+      // If this scroll position exceeds the maximum, clamp to max scroll
+      // This ensures we capture the bottom of the page
+      if (scrollY > maxScrollY) {
+        // Only take this final capture if we haven't already captured this area
+        // Check if previous capture already covered the bottom
+        const prevScrollY = (i - 1) * (viewportHeight - OVERLAP_HEIGHT);
+        const prevCaptureBottom = prevScrollY + viewportHeight;
+
+        if (prevCaptureBottom >= scrollHeight) {
+          log(`Capture ${i + 1}: Previous capture already covered bottom, stopping`);
+          break;
+        }
+
+        // Clamp to max scroll to capture remaining content
+        scrollY = maxScrollY;
+        log(`Capture ${i + 1}: Clamping scrollY to maxScrollY=${maxScrollY} to capture bottom`);
       }
 
       // Hide fixed/sticky elements after first capture to avoid duplicates
@@ -230,6 +247,10 @@ async function scrollAndStitchCapture(tabId, sessionId) {
         scrollY,
         viewportHeight,
         viewportWidth,
+        windowHeight,
+        windowWidth,
+        containerBounds,
+        useCustomContainer,
         isLastCapture: scrollY + viewportHeight >= scrollHeight
       });
 
@@ -268,6 +289,10 @@ async function scrollAndStitchCapture(tabId, sessionId) {
         scrollY: captures[i].scrollY,
         viewportHeight: captures[i].viewportHeight,
         viewportWidth: captures[i].viewportWidth,
+        windowHeight: captures[i].windowHeight,
+        windowWidth: captures[i].windowWidth,
+        containerBounds: captures[i].containerBounds,
+        useCustomContainer: captures[i].useCustomContainer,
         isLastCapture: captures[i].isLastCapture
       });
     }
@@ -275,11 +300,17 @@ async function scrollAndStitchCapture(tabId, sessionId) {
     // Step 4: Create offscreen document and send for stitching
     await createOffscreenDocument();
 
+    // For full-page capture, we DON'T crop to container bounds
+    // We use the container for scrolling, but capture the full window
+    // Container cropping is only for "center section" captures
     const stitchResult = await sendToOffscreen({
       type: 'STITCH_CAPTURES',
       captures: captureDataUrls,
       overlapHeight: OVERLAP_HEIGHT,
-      tabUrl: 'page'
+      tabUrl: 'page',
+      useCustomContainer: false, // Don't crop for full-page capture
+      containerBounds: null,     // No cropping bounds
+      devicePixelRatio: devicePixelRatio
     });
 
     if (!stitchResult || stitchResult.error) {
@@ -620,6 +651,238 @@ async function elementCapture(tabId, elementInfo, sessionId) {
 }
 
 /**
+ * Jira center-section capture - captures only the center content area
+ * Scrolls within Jira's scroll container and crops each capture to center bounds
+ */
+async function jiraCenterCapture(tabId, sessionId) {
+  log('Starting Jira center-section capture');
+
+  try {
+    // Step 0: Ensure content script is injected
+    updateCaptureState(sessionId, 'preparing', 'Preparing Jira page...');
+    await ensureContentScript(tabId);
+
+    // Step 1: Get Jira center section dimensions
+    updateCaptureState(sessionId, 'capturing', 'Getting Jira center dimensions...');
+    const initResult = await chrome.tabs.sendMessage(tabId, {
+      type: 'JIRA_CENTER_CAPTURE_INIT'
+    });
+
+    if (!initResult.success) {
+      throw new Error(initResult.error || 'Failed to initialize Jira center capture');
+    }
+
+    log('Jira center capture init:', initResult);
+
+    const { centerBounds, scrollInfo, devicePixelRatio, viewportHeight, viewportWidth } = initResult;
+
+    // Configuration
+    const OVERLAP_HEIGHT = 75;
+    const MAX_CAPTURES = 100;
+
+    // Calculate scroll parameters
+    const scrollableHeight = scrollInfo.scrollHeight - scrollInfo.clientHeight;
+    const captureViewportHeight = scrollInfo.clientHeight;
+
+    // Calculate number of captures needed
+    // We need enough captures to cover the full scrollHeight
+    // Each capture after the first covers (captureViewportHeight - OVERLAP_HEIGHT) new pixels
+    let numCaptures = 1;
+    if (scrollableHeight > 0) {
+      // Add 1 to ensure we always have room for a final capture at maxScrollY
+      numCaptures = Math.ceil(scrollableHeight / (captureViewportHeight - OVERLAP_HEIGHT)) + 2;
+    }
+    numCaptures = Math.min(numCaptures, MAX_CAPTURES);
+
+    log(`Jira center: ${numCaptures} captures needed (scrollHeight: ${scrollInfo.scrollHeight}, viewportHeight: ${captureViewportHeight})`);
+
+    // Step 2: Capture each viewport
+    const captures = [];
+    const originalScrollY = scrollInfo.scrollTop;
+    const maxScrollY = scrollableHeight; // Maximum scroll position
+    let lastCapturedScrollY = -1; // Track what we've actually captured
+
+    for (let i = 0; i < numCaptures; i++) {
+      let scrollY = i * (captureViewportHeight - OVERLAP_HEIGHT);
+
+      // If this scroll position exceeds the maximum, clamp to max scroll
+      if (scrollY > maxScrollY) {
+        scrollY = maxScrollY;
+      }
+
+      // Skip if we've already captured at this exact scroll position
+      if (scrollY === lastCapturedScrollY) {
+        log(`Capture ${i + 1}: Already captured at scrollY=${scrollY}, stopping`);
+        break;
+      }
+
+      // Check if the previous capture already covered the entire page
+      if (lastCapturedScrollY >= 0) {
+        const prevCaptureBottom = lastCapturedScrollY + captureViewportHeight;
+        if (prevCaptureBottom >= scrollInfo.scrollHeight) {
+          log(`Capture ${i + 1}: Previous capture already covered bottom (${prevCaptureBottom} >= ${scrollInfo.scrollHeight}), stopping`);
+          break;
+        }
+      }
+
+      log(`Capture ${i + 1}/${numCaptures}: Planning to scroll to Y=${scrollY} (maxScrollY=${maxScrollY})`);
+
+      // Hide fixed/sticky elements after first capture
+      if (i === 1 && numCaptures > 1) {
+        log('Hiding fixed/sticky elements for subsequent captures');
+        try {
+          await chrome.tabs.sendMessage(tabId, { type: 'HIDE_FIXED_ELEMENTS' });
+        } catch (e) {
+          log('Warning: Could not hide fixed elements:', e.message);
+        }
+      }
+
+      const progress = Math.round((i / numCaptures) * 100);
+      updateCaptureState(sessionId, 'capturing', `Capturing Jira center ${i + 1}/${numCaptures}...`, progress);
+
+      // Scroll Jira's scroll container
+      const scrollResult = await chrome.tabs.sendMessage(tabId, {
+        type: 'JIRA_CENTER_SCROLL_TO',
+        y: scrollY
+      });
+
+      if (!scrollResult.success) {
+        throw new Error(`Failed to scroll Jira to Y=${scrollY}`);
+      }
+
+      const actualScrollY = scrollResult.scrolledToY;
+      log(`Capture ${i + 1}: Jira scroll confirmed at Y=${actualScrollY} (requested ${scrollY})`);
+
+      // Wait for content to render
+      await new Promise(r => setTimeout(r, 600));
+
+      // Capture visible tab with retry logic
+      log(`Capture ${i + 1}: Taking screenshot...`);
+      let dataUrl;
+      let retries = 3;
+      while (retries > 0) {
+        try {
+          dataUrl = await chrome.tabs.captureVisibleTab(
+            { format: 'png', quality: 100 }
+          );
+          break;
+        } catch (captureError) {
+          retries--;
+          if (captureError.message.includes('quota') && retries > 0) {
+            log(`Rate limited, waiting and retrying... (${retries} retries left)`);
+            await new Promise(r => setTimeout(r, 1000));
+          } else {
+            throw captureError;
+          }
+        }
+      }
+
+      // Convert to blob and store metadata
+      const response = await fetch(dataUrl);
+      const blob = await response.blob();
+
+      // Track that we captured at this scroll position
+      lastCapturedScrollY = actualScrollY;
+
+      // Determine if this capture covers the bottom of the content
+      const captureCoversBottom = actualScrollY + captureViewportHeight >= scrollInfo.scrollHeight;
+
+      captures.push({
+        blob,
+        scrollY: actualScrollY,
+        viewportHeight: captureViewportHeight,
+        viewportWidth,
+        isLastCapture: captureCoversBottom
+      });
+
+      log(`Capture ${i + 1}: Stored (size: ${blob.size} bytes, coversBottom: ${captureCoversBottom})`);
+    }
+
+    // Restore fixed elements after all captures
+    if (numCaptures > 1) {
+      log('Restoring fixed/sticky elements');
+      try {
+        await chrome.tabs.sendMessage(tabId, { type: 'RESTORE_FIXED_ELEMENTS' });
+      } catch (e) {
+        log('Warning: Could not restore fixed elements:', e.message);
+      }
+    }
+
+    if (captures.length === 0) {
+      throw new Error('No captures were collected');
+    }
+
+    log(`Collected ${captures.length} Jira center captures, sending to offscreen for stitching`);
+
+    // Step 3: Convert blobs to data URLs for transmission
+    updateCaptureState(sessionId, 'stitching', 'Stitching Jira center captures...', 95);
+
+    const captureDataUrls = [];
+    for (let i = 0; i < captures.length; i++) {
+      const reader = new FileReader();
+      const dataUrl = await new Promise((resolve, reject) => {
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(captures[i].blob);
+      });
+      captureDataUrls.push({
+        dataUrl,
+        scrollY: captures[i].scrollY,
+        viewportHeight: captures[i].viewportHeight,
+        viewportWidth: captures[i].viewportWidth,
+        isLastCapture: captures[i].isLastCapture
+      });
+    }
+
+    // Step 4: Create offscreen document and send for stitching with crop bounds
+    await createOffscreenDocument();
+
+    // Send crop bounds so offscreen can crop to center section
+    const cropBounds = {
+      left: centerBounds.left,
+      top: centerBounds.top,
+      width: centerBounds.width,
+      height: scrollInfo.clientHeight, // Height of each viewport's visible center
+      devicePixelRatio: devicePixelRatio,
+      totalHeight: scrollInfo.scrollHeight // Total content height for final image
+    };
+
+    log('Sending to offscreen with crop bounds:', cropBounds);
+
+    const stitchResult = await sendToOffscreen({
+      type: 'STITCH_JIRA_CENTER_CAPTURES',
+      captures: captureDataUrls,
+      overlapHeight: OVERLAP_HEIGHT,
+      cropBounds,
+      tabUrl: 'jira-center'
+    });
+
+    if (!stitchResult || stitchResult.error) {
+      throw new Error(stitchResult?.error || 'Offscreen stitching failed');
+    }
+
+    log('Jira center stitching complete, received:', stitchResult.pngBlobUrl);
+
+    // Step 5: Restore original scroll position
+    log('Restoring original Jira scroll position...');
+    try {
+      await chrome.tabs.sendMessage(tabId, {
+        type: 'JIRA_CENTER_SCROLL_TO',
+        y: originalScrollY
+      });
+    } catch (e) {
+      log('Warning: Could not restore Jira scroll position:', e);
+    }
+
+    return stitchResult;
+
+  } catch (e) {
+    error('Jira center capture failed:', e);
+    throw e;
+  }
+}
+
+/**
  * Pre-capture DOM stabilization
  */
 async function stabilizeDOM(tabId, maxDuration) {
@@ -954,6 +1217,105 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  // Jira center-section capture
+  if (message.type === 'START_JIRA_CENTER_CAPTURE') {
+    const sessionId = Math.random().toString(36).substring(7);
+    log(`Starting Jira center capture session ${sessionId}`);
+
+    (async () => {
+      try {
+        const tab = await getCurrentTab();
+        if (!tab.id) throw new Error('Tab ID not available');
+
+        // Validate URL is capturable
+        if (!isCapturableUrl(tab.url)) {
+          throw new Error('Cannot capture this page');
+        }
+
+        // Store session
+        activeSessions.set(sessionId, {
+          tabId: tab.id,
+          startTime: Date.now(),
+          status: 'jira_center_capture'
+        });
+
+        updateCaptureState(sessionId, 'started', 'Starting Jira center capture...');
+
+        // Capture the Jira center section
+        const stitchResult = await jiraCenterCapture(tab.id, sessionId);
+
+        // Download the stitched PNG with jira-center suffix
+        const hostname = new URL(tab.url || 'https://page').hostname || 'page';
+        const tabTitle = sanitizeForFilename(tab.title || '', 40);
+        const timestamp = new Date().toISOString().replace(/[^\d]/g, '').substring(0, 14);
+        const filename = tabTitle
+          ? `${tabTitle}_${hostname}_${timestamp}_center.png`
+          : `capture_${hostname}_${timestamp}_center.png`;
+
+        updateCaptureState(sessionId, 'downloading', 'Downloading image...');
+
+        await chrome.downloads.download({
+          url: stitchResult.pngBlobUrl,
+          filename,
+          saveAs: false
+        });
+
+        // Clean up blob URL
+        try {
+          if (typeof URL !== 'undefined' && URL.revokeObjectURL) {
+            URL.revokeObjectURL(stitchResult.pngBlobUrl);
+          }
+        } catch (e) {
+          log('Could not revoke blob URL (expected in service worker):', e.message);
+        }
+
+        updateCaptureState(sessionId, 'completed', 'Jira center capture complete!', 100);
+        log(`Jira center capture session ${sessionId} completed successfully`);
+
+        // Clear capture state after a short delay
+        setTimeout(() => {
+          if (currentCaptureState && currentCaptureState.sessionId === sessionId) {
+            currentCaptureState = null;
+          }
+        }, 5000);
+
+      } catch (e) {
+        error(`Jira center capture failed: ${e.message}`);
+        updateCaptureState(sessionId, 'error', `Capture failed: ${e.message}`);
+      } finally {
+        activeSessions.delete(sessionId);
+      }
+    })();
+
+    sendResponse({ success: true, sessionId });
+    return true;
+  }
+
+  // Detect if current page has site-specific handler (for popup to show extra options)
+  if (message.type === 'DETECT_SITE_TYPE') {
+    (async () => {
+      try {
+        const tab = await getCurrentTab();
+        if (!tab.id) {
+          sendResponse({ success: false, error: 'No active tab' });
+          return;
+        }
+
+        await ensureContentScript(tab.id);
+
+        const result = await chrome.tabs.sendMessage(tab.id, {
+          type: 'DETECT_SITE_TYPE'
+        });
+
+        sendResponse(result);
+      } catch (e) {
+        error('Site detection failed:', e);
+        sendResponse({ success: false, error: e.message });
+      }
+    })();
+    return true;
+  }
+
   sendResponse({ error: 'Unknown message type' });
 });
 
@@ -989,6 +1351,89 @@ chrome.commands.onCommand.addListener(async (command) => {
       await startElementSelect();
     } catch (e) {
       error('Failed to start region capture:', e);
+    }
+  }
+
+  if (command === 'capture-jira-center') {
+    // Check if capture is already in progress
+    if (currentCaptureState &&
+        currentCaptureState.status !== 'completed' &&
+        currentCaptureState.status !== 'error') {
+      log('Capture already in progress, ignoring hotkey');
+      return;
+    }
+
+    try {
+      // First check if we're on a Jira page
+      const tab = await getCurrentTab();
+      if (!tab.id) {
+        log('No active tab for Jira center capture');
+        return;
+      }
+
+      await ensureContentScript(tab.id);
+
+      const siteDetection = await chrome.tabs.sendMessage(tab.id, {
+        type: 'DETECT_SITE_TYPE'
+      });
+
+      if (!siteDetection.success || !siteDetection.detected || siteDetection.siteType !== 'Jira') {
+        log('Not on a Jira page, ignoring Jira center capture hotkey');
+        // Could show a notification here if desired
+        return;
+      }
+
+      // Start Jira center capture
+      const sessionId = Math.random().toString(36).substring(7);
+      log(`Starting Jira center capture session ${sessionId} via hotkey`);
+
+      activeSessions.set(sessionId, {
+        tabId: tab.id,
+        startTime: Date.now(),
+        status: 'jira_center_capture'
+      });
+
+      updateCaptureState(sessionId, 'started', 'Starting Jira center capture...');
+
+      const stitchResult = await jiraCenterCapture(tab.id, sessionId);
+
+      // Download the stitched PNG
+      const hostname = new URL(tab.url || 'https://page').hostname || 'page';
+      const tabTitle = sanitizeForFilename(tab.title || '', 40);
+      const timestamp = new Date().toISOString().replace(/[^\d]/g, '').substring(0, 14);
+      const filename = tabTitle
+        ? `${tabTitle}_${hostname}_${timestamp}_center.png`
+        : `capture_${hostname}_${timestamp}_center.png`;
+
+      updateCaptureState(sessionId, 'downloading', 'Downloading image...');
+
+      await chrome.downloads.download({
+        url: stitchResult.pngBlobUrl,
+        filename,
+        saveAs: false
+      });
+
+      try {
+        if (typeof URL !== 'undefined' && URL.revokeObjectURL) {
+          URL.revokeObjectURL(stitchResult.pngBlobUrl);
+        }
+      } catch (e) {
+        log('Could not revoke blob URL:', e.message);
+      }
+
+      updateCaptureState(sessionId, 'completed', 'Jira center capture complete!', 100);
+      log(`Jira center capture session ${sessionId} completed successfully`);
+
+      setTimeout(() => {
+        if (currentCaptureState && currentCaptureState.sessionId === sessionId) {
+          currentCaptureState = null;
+        }
+      }, 5000);
+
+      activeSessions.delete(sessionId);
+
+    } catch (e) {
+      error('Failed to start Jira center capture:', e);
     }
   }
 });

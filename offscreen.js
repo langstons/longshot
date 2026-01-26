@@ -346,10 +346,16 @@ async function stitchElementCaptures(captures, elementBounds, overlapHeight) {
 
 /**
  * Stitch captured viewport images together
+ * @param {Array} captures - Array of capture objects
+ * @param {number} overlapHeight - Overlap between captures in pixels
+ * @param {boolean} useCustomContainer - Whether captures are from a custom scroll container
+ * @param {Object} containerBounds - Bounds of the custom container (if applicable)
+ * @param {number} devicePixelRatio - Device pixel ratio for scaling
  */
-async function stitchCapturedViewports(captures, overlapHeight) {
+async function stitchCapturedViewports(captures, overlapHeight, useCustomContainer = false, containerBounds = null, devicePixelRatio = 1) {
   try {
     log(`Stitching ${captures.length} viewport captures with ${overlapHeight}px overlap`);
+    log(`Custom container: ${useCustomContainer}, bounds:`, containerBounds);
 
     if (captures.length === 0) {
       throw new Error('No captures to stitch');
@@ -368,6 +374,12 @@ async function stitchCapturedViewports(captures, overlapHeight) {
         scrollY: captures[i].scrollY,
         isLastCapture: captures[i].isLastCapture
       });
+    }
+
+    // If using a custom container, we need to crop each capture to the container area
+    // and stitch only the container content
+    if (useCustomContainer && containerBounds) {
+      return await stitchCustomContainerCaptures(images, overlapHeight, containerBounds, devicePixelRatio);
     }
 
     // Detect sticky header by comparing first two captures
@@ -453,6 +465,251 @@ async function stitchCapturedViewports(captures, overlapHeight) {
 }
 
 /**
+ * Stitch captures from a custom scroll container (like Jira's .issue-view)
+ * Crops each capture to the container bounds before stitching
+ */
+async function stitchCustomContainerCaptures(images, overlapHeight, containerBounds, devicePixelRatio) {
+  try {
+    log(`Stitching ${images.length} custom container captures`);
+    log(`Container bounds:`, containerBounds);
+
+    // Scale container bounds by device pixel ratio
+    const scaledBounds = {
+      left: Math.round(containerBounds.left * devicePixelRatio),
+      top: Math.round(containerBounds.top * devicePixelRatio),
+      width: Math.round(containerBounds.width * devicePixelRatio),
+      height: Math.round(containerBounds.height * devicePixelRatio)
+    };
+    const scaledOverlap = Math.round(overlapHeight * devicePixelRatio);
+
+    log(`Scaled bounds: left=${scaledBounds.left}, top=${scaledBounds.top}, width=${scaledBounds.width}, height=${scaledBounds.height}`);
+
+    // Detect sticky header by comparing the container region of first two captures
+    let stickyHeaderHeight = 0;
+    if (images.length >= 2) {
+      const maxCompareHeight = Math.min(200 * devicePixelRatio, scaledBounds.height / 2);
+      stickyHeaderHeight = detectStickyHeaderHeight(
+        images[0].img,
+        images[1].img,
+        scaledBounds.left,
+        maxCompareHeight,
+        scaledBounds.width
+      );
+      if (stickyHeaderHeight > 0) {
+        log(`Detected sticky header in container: ${stickyHeaderHeight}px`);
+      }
+    }
+
+    // Calculate total output height
+    // First capture: full container height
+    // Subsequent captures: container height minus overlap minus sticky header
+    let totalHeight = scaledBounds.height;
+    for (let i = 1; i < images.length; i++) {
+      totalHeight += scaledBounds.height - scaledOverlap - stickyHeaderHeight;
+    }
+
+    log(`Total output dimensions: ${scaledBounds.width}x${totalHeight}`);
+
+    // Create output canvas
+    const outputWidth = sanitizeCanvasDimension(scaledBounds.width, 800);
+    const outputHeight = sanitizeCanvasDimension(totalHeight, 600);
+
+    const outputCanvas = new OffscreenCanvas(outputWidth, outputHeight);
+    const ctx = outputCanvas.getContext('2d');
+
+    if (!ctx) {
+      throw new Error('Failed to get canvas context');
+    }
+
+    // Draw each cropped capture
+    let currentY = 0;
+
+    for (let i = 0; i < images.length; i++) {
+      const image = images[i];
+      const isFirstCapture = i === 0;
+
+      // Source coordinates: crop to container bounds
+      const srcX = scaledBounds.left;
+      const srcY = isFirstCapture
+        ? scaledBounds.top
+        : scaledBounds.top + scaledOverlap + stickyHeaderHeight;
+      const srcWidth = scaledBounds.width;
+      const srcHeight = isFirstCapture
+        ? scaledBounds.height
+        : scaledBounds.height - scaledOverlap - stickyHeaderHeight;
+
+      // Clamp to image bounds
+      const clampedSrcWidth = Math.min(srcWidth, image.img.width - srcX);
+      const clampedSrcHeight = Math.min(srcHeight, image.img.height - srcY);
+
+      if (clampedSrcWidth <= 0 || clampedSrcHeight <= 0) {
+        log(`Capture ${i + 1}: Skipping - no visible content`);
+        continue;
+      }
+
+      log(`Drawing capture ${i + 1}: src(${srcX}, ${srcY}, ${clampedSrcWidth}x${clampedSrcHeight}) -> dest(0, ${currentY})`);
+
+      ctx.drawImage(
+        image.img,
+        srcX, srcY, clampedSrcWidth, clampedSrcHeight,
+        0, currentY, clampedSrcWidth, clampedSrcHeight
+      );
+
+      currentY += clampedSrcHeight;
+    }
+
+    // Trim canvas if needed
+    if (currentY < outputHeight && currentY > 0) {
+      log(`Trimming canvas from ${outputHeight} to ${currentY}`);
+      const trimmedCanvas = new OffscreenCanvas(outputWidth, currentY);
+      const trimmedCtx = trimmedCanvas.getContext('2d');
+      trimmedCtx.drawImage(outputCanvas, 0, 0);
+
+      const blob = await trimmedCanvas.convertToBlob({ type: 'image/png' });
+      log(`Stitched custom container PNG created: ${blob.size} bytes`);
+      return blob;
+    }
+
+    const blob = await outputCanvas.convertToBlob({ type: 'image/png' });
+    log(`Stitched custom container PNG created: ${blob.size} bytes`);
+    return blob;
+
+  } catch (e) {
+    error('Failed to stitch custom container captures:', e);
+    throw new Error(`Failed to stitch custom container captures: ${e.message}`);
+  }
+}
+
+/**
+ * Stitch Jira center-section captures with cropping
+ *
+ * @param {Array} captures - Array of {dataUrl, viewportHeight, viewportWidth, scrollY, isLastCapture}
+ * @param {Object} cropBounds - {left, top, width, height, devicePixelRatio, totalHeight}
+ * @param {number} overlapHeight - Overlap in pixels between captures
+ * @returns {Promise<Blob>} PNG blob of stitched center section
+ */
+async function stitchJiraCenterCaptures(captures, cropBounds, overlapHeight) {
+  try {
+    log(`Stitching ${captures.length} Jira center captures with cropping`);
+    log(`Crop bounds:`, cropBounds);
+
+    if (captures.length === 0) {
+      throw new Error('No captures to stitch');
+    }
+
+    const { left, top, width, height, devicePixelRatio } = cropBounds;
+
+    // Scale coordinates by device pixel ratio
+    const scaledLeft = Math.round(left * devicePixelRatio);
+    const scaledTop = Math.round(top * devicePixelRatio);
+    const scaledWidth = Math.round(width * devicePixelRatio);
+    const scaledHeight = Math.round(height * devicePixelRatio); // Height of each viewport's center
+    const scaledOverlapHeight = Math.round(overlapHeight * devicePixelRatio);
+
+    log(`Scaled dimensions: crop at (${scaledLeft}, ${scaledTop}), size ${scaledWidth}x${scaledHeight}`);
+
+    // Load all images
+    log('Loading all captured images...');
+    const images = [];
+    for (let i = 0; i < captures.length; i++) {
+      log(`Loading capture ${i + 1}/${captures.length}...`);
+      const img = await loadImageFromDataUrl(captures[i].dataUrl);
+      images.push({
+        img,
+        scrollY: Math.round(captures[i].scrollY * devicePixelRatio),
+        isLastCapture: captures[i].isLastCapture
+      });
+    }
+
+    // Calculate actual output height based on captures
+    // First capture: full viewport height, subsequent captures: minus overlap
+    let calculatedTotalHeight = scaledHeight; // First capture
+    for (let i = 1; i < images.length; i++) {
+      calculatedTotalHeight += scaledHeight - scaledOverlapHeight;
+    }
+
+    log(`Calculated total height from ${captures.length} captures: ${calculatedTotalHeight}`);
+
+    // Calculate output canvas size
+    const outputWidth = sanitizeCanvasDimension(scaledWidth, 800);
+    const outputHeight = sanitizeCanvasDimension(calculatedTotalHeight, 600);
+
+    log(`Output canvas dimensions: ${outputWidth}x${outputHeight}`);
+
+    // Create output canvas
+    log('Creating output canvas...');
+    const outputCanvas = new OffscreenCanvas(outputWidth, outputHeight);
+    const ctx = outputCanvas.getContext('2d');
+
+    if (!ctx) {
+      throw new Error('Failed to get canvas context');
+    }
+
+    // Draw each cropped viewport
+    let currentDestY = 0;
+
+    for (let i = 0; i < images.length; i++) {
+      const image = images[i];
+      const isFirstCapture = i === 0;
+
+      // Source coordinates in the capture image (crop to center section)
+      const srcX = scaledLeft;
+      let srcY = scaledTop;
+      let srcHeight = scaledHeight;
+
+      // For subsequent captures, skip the overlap region
+      if (!isFirstCapture) {
+        srcY += scaledOverlapHeight;
+        srcHeight -= scaledOverlapHeight;
+      }
+
+      // Clamp source dimensions to image bounds
+      srcHeight = Math.min(srcHeight, image.img.height - srcY);
+      const srcWidth = Math.min(scaledWidth, image.img.width - srcX);
+
+      if (srcHeight <= 0 || srcWidth <= 0) {
+        log(`Capture ${i + 1}: Skipping - no visible content`);
+        continue;
+      }
+
+      log(`Drawing capture ${i + 1}: src(${srcX}, ${srcY}, ${srcWidth}x${srcHeight}) -> dest(0, ${currentDestY})`);
+
+      ctx.drawImage(
+        image.img,
+        srcX, srcY, srcWidth, srcHeight,
+        0, currentDestY, srcWidth, srcHeight
+      );
+
+      currentDestY += srcHeight;
+    }
+
+    log(`Jira center stitching complete, drew ${currentDestY}px of content`);
+
+    // If we didn't fill the whole canvas, trim it
+    if (currentDestY < outputHeight && currentDestY > 0) {
+      log(`Trimming canvas from ${outputHeight} to ${currentDestY}`);
+      const trimmedCanvas = new OffscreenCanvas(outputWidth, currentDestY);
+      const trimmedCtx = trimmedCanvas.getContext('2d');
+      trimmedCtx.drawImage(outputCanvas, 0, 0);
+
+      const blob = await trimmedCanvas.convertToBlob({ type: 'image/png' });
+      log(`Stitched Jira center PNG created: ${blob.size} bytes`);
+      return blob;
+    }
+
+    // Convert to blob
+    const blob = await outputCanvas.convertToBlob({ type: 'image/png' });
+    log(`Stitched Jira center PNG created: ${blob.size} bytes`);
+
+    return blob;
+
+  } catch (e) {
+    error('Failed to stitch Jira center captures:', e);
+    throw new Error(`Failed to stitch Jira center captures: ${e.message}`);
+  }
+}
+
+/**
  * Handle message from background
  */
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -460,8 +717,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === 'STITCH_CAPTURES') {
     log('Processing STITCH_CAPTURES request');
+    log('Custom container:', message.useCustomContainer, 'bounds:', message.containerBounds);
 
-    stitchCapturedViewports(message.captures, message.overlapHeight)
+    stitchCapturedViewports(
+      message.captures,
+      message.overlapHeight,
+      message.useCustomContainer,
+      message.containerBounds,
+      message.devicePixelRatio || 1
+    )
       .then((blob) => {
         const pngBlobUrl = URL.createObjectURL(blob);
         log('Sending stitched PNG blob URL');
@@ -501,6 +765,33 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         error('Element stitching failed:', e);
         sendResponse({
           error: e.message || 'Failed to stitch element captures'
+        });
+      });
+
+    return true; // Will respond asynchronously
+  }
+
+  if (message.type === 'STITCH_JIRA_CENTER_CAPTURES') {
+    log('Processing STITCH_JIRA_CENTER_CAPTURES request');
+    log('Message payload:', {
+      captureCount: message.captures?.length,
+      cropBounds: message.cropBounds,
+      overlapHeight: message.overlapHeight
+    });
+
+    stitchJiraCenterCaptures(message.captures, message.cropBounds, message.overlapHeight)
+      .then((blob) => {
+        const pngBlobUrl = URL.createObjectURL(blob);
+        log('Sending stitched Jira center PNG blob URL');
+        sendResponse({
+          success: true,
+          pngBlobUrl: pngBlobUrl
+        });
+      })
+      .catch((e) => {
+        error('Jira center stitching failed:', e);
+        sendResponse({
+          error: e.message || 'Failed to stitch Jira center captures'
         });
       });
 
