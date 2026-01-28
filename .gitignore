@@ -4,3 +4,6 @@
 *.pem
 !icons/*.png
 .DS_Store
+
+# Chrome Web Store listing content (local reference only)
+CHROME_WEB_STORE_LISTING.md
