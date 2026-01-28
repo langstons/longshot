@@ -17,16 +17,68 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
+    outputs:
+      has_key: ${{ steps.check_secret.outputs.has_key }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
+      - name: Setup environment
+        run: |
+          echo "OS: $RUNNER_OS"
+          if [ "$RUNNER_OS" = "macOS" ] || [ -d "/opt/homebrew" ]; then
+            echo "/opt/homebrew/bin" >> $GITHUB_PATH
+            echo "Using Homebrew paths for macOS"
+          fi
+
+      - name: Verify prerequisites
+        run: |
+          echo "Checking self-hosted runner prerequisites..."
+          echo "Runner: $RUNNER_NAME"
+          echo "PATH: $PATH"
+
+          # Debug: Check common locations
+          echo "Checking for node..."
+          ls -la /opt/homebrew/bin/node 2>&1 || echo "Not at /opt/homebrew/bin/node"
+          ls -la /usr/local/bin/node 2>&1 || echo "Not at /usr/local/bin/node"
+          which node 2>&1 || echo "which node failed"
+
+          # Try to find and use node
+          if [ -x /opt/homebrew/bin/node ]; then
+            NODE_CMD=/opt/homebrew/bin/node
+          elif [ -x /usr/local/bin/node ]; then
+            NODE_CMD=/usr/local/bin/node
+          elif which node >/dev/null 2>&1; then
+            NODE_CMD=$(which node)
+          else
+            echo "❌ Node.js is required but not installed in any expected location."
+            echo "Runner $RUNNER_NAME does not have Node.js available."
+            exit 1
+          fi
+          echo "✓ Node.js: $($NODE_CMD --version)"
+
+          # Try to find and use jq
+          if [ -x /opt/homebrew/bin/jq ]; then
+            JQ_CMD=/opt/homebrew/bin/jq
+          elif [ -x /usr/local/bin/jq ]; then
+            JQ_CMD=/usr/local/bin/jq
+          elif which jq >/dev/null 2>&1; then
+            JQ_CMD=$(which jq)
+          else
+            echo "❌ jq is required but not installed."
+            exit 1
+          fi
+          echo "✓ jq: $($JQ_CMD --version)"
+
+          openssl version || { echo "❌ openssl is required but not installed."; exit 1; }
+          echo "✓ openssl: $(openssl version)"
+
+          zip --version | head -2 || { echo "❌ zip is required but not installed."; exit 1; }
+          echo "✓ zip available"
+
+          echo "✅ All prerequisites satisfied"
 
       - name: Get version from tag or input
         id: version
@@ -41,10 +93,16 @@ jobs:
       - name: Update manifest version
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          jq --arg v "$VERSION" '.version = $v' manifest.json > manifest.tmp && mv manifest.tmp manifest.json
+          # Find jq command
+          if [ -x /opt/homebrew/bin/jq ]; then
+            JQ_CMD=/opt/homebrew/bin/jq
+          else
+            JQ_CMD=jq
+          fi
+          $JQ_CMD --arg v "$VERSION" '.version = $v' manifest.json > manifest.tmp && mv manifest.tmp manifest.json
           cat manifest.json | grep version
 
-      - name: Create ZIP file
+      - name: Create ZIP file (Chrome Web Store version)
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           zip -r "longshot-${VERSION}.zip" \
@@ -55,7 +113,10 @@ jobs:
             offscreen.js \
             popup.html \
             popup.js \
-            icons/
+            options.html \
+            options.js \
+            icons/ \
+            -x "*.DS_Store"
           ls -la *.zip
 
       - name: Check for CRX secret
@@ -65,11 +126,15 @@ jobs:
             echo "has_key=true" >> $GITHUB_OUTPUT
           else
             echo "has_key=false" >> $GITHUB_OUTPUT
+            echo "WARNING: CRX_PRIVATE_KEY secret not found. Skipping CRX build."
           fi
 
       - name: Install CRX tools
         if: steps.check_secret.outputs.has_key == 'true'
-        run: npm install -g crx
+        run: |
+          if ! command -v crx >/dev/null 2>&1; then
+            npm install -g crx
+          fi
 
       - name: Create CRX file and get Extension ID
         id: crx
@@ -100,11 +165,17 @@ jobs:
 
           # Create a temporary directory with extension files
           mkdir -p extension
-          cp manifest.json background.js contentScript.js offscreen.html offscreen.js popup.html popup.js extension/
+          cp manifest.json extension/
+          cp background.js contentScript.js offscreen.html offscreen.js popup.html popup.js options.html options.js extension/
           cp -r icons extension/
 
           # Add update_url to manifest for CRX auto-updates (not allowed in Chrome Web Store ZIP)
-          jq '. + {"update_url": "https://langstons.github.io/longshot/updates.xml"}' extension/manifest.json > extension/manifest.tmp && mv extension/manifest.tmp extension/manifest.json
+          if [ -x /opt/homebrew/bin/jq ]; then
+            JQ_CMD=/opt/homebrew/bin/jq
+          else
+            JQ_CMD=jq
+          fi
+          $JQ_CMD '. + {"update_url": "https://privatelinkio.github.io/longshot/updates.xml"}' extension/manifest.json > extension/manifest.tmp && mv extension/manifest.tmp extension/manifest.json
 
           # Create CRX
           crx pack extension -p longshot.pem -o "longshot-${VERSION}.crx"
@@ -120,7 +191,7 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           EXTENSION_ID="${{ steps.crx.outputs.extension_id }}"
-          CRX_URL="https://github.com/langstons/longshot/releases/download/v${VERSION}/longshot-${VERSION}.crx"
+          CRX_URL="https://github.com/privatelinkio/longshot/releases/download/v${VERSION}/longshot-${VERSION}.crx"
 
           cat > updates.xml << EOF
           <?xml version='1.0' encoding='UTF-8'?>
@@ -164,7 +235,7 @@ jobs:
 
             **Enterprise Deployment (CRX with Auto-Update)**:
             - Deploy `longshot-${{ steps.version.outputs.version }}.crx` via enterprise policy
-            - Auto-updates via: `https://langstons.github.io/longshot/updates.xml`
+            - Auto-updates via: `https://privatelinkio.github.io/longshot/updates.xml`
             - Extension ID: `${{ steps.crx.outputs.extension_id }}`
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -183,7 +254,11 @@ jobs:
 
   deploy-pages:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
+    if: needs.build.outputs.has_key == 'true'
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
