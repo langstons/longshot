@@ -405,13 +405,15 @@ function getScrollDimensions(element) {
  */
 function scrollElement(element, x, y) {
   if (element === null) {
-    window.scrollTo(x, y);
+    // Force instant scroll to bypass CSS scroll-behavior: smooth
+    window.scrollTo({ left: x, top: y, behavior: 'instant' });
     return {
       scrolledToX: window.scrollX,
       scrolledToY: window.scrollY
     };
   } else {
-    element.scrollTo(x, y);
+    // Force instant scroll for container elements too
+    element.scrollTo({ left: x, top: y, behavior: 'instant' });
     return {
       scrolledToX: element.scrollLeft,
       scrolledToY: element.scrollTop
@@ -731,7 +733,9 @@ function findFixedElements() {
       if (!ancestorAlreadyHidden) {
         fixed.push({
           element: el,
-          originalDisplay: el.style.display
+          computedPosition: style.position,
+          originalDisplay: el.style.display,
+          originalPosition: el.style.position
         });
         seen.add(el);
         log(`Found fixed/sticky element: ${el.tagName}.${el.className}, position: ${style.position}`);
@@ -745,6 +749,8 @@ function findFixedElements() {
 
 /**
  * Hide all fixed/sticky elements (for captures after the first)
+ * - position:fixed elements → display:none (out of flow, no layout shift)
+ * - position:sticky elements → position:relative (stays in flow, prevents sticking)
  */
 function hideFixedElements() {
   if (hiddenFixedElements.length === 0) {
@@ -752,10 +758,16 @@ function hideFixedElements() {
   }
 
   for (const item of hiddenFixedElements) {
-    item.element.style.display = 'none';
+    if (item.computedPosition === 'fixed') {
+      item.element.style.display = 'none';
+    } else if (item.computedPosition === 'sticky') {
+      // Change to relative so element stays in document flow (no layout shift)
+      // but won't stick to viewport during subsequent captures
+      item.element.style.position = 'relative';
+    }
   }
 
-  log(`Hidden ${hiddenFixedElements.length} fixed elements with display:none`);
+  log(`Hidden ${hiddenFixedElements.length} fixed/sticky elements`);
 }
 
 /**
@@ -763,10 +775,14 @@ function hideFixedElements() {
  */
 function restoreFixedElements() {
   for (const item of hiddenFixedElements) {
-    item.element.style.display = item.originalDisplay || '';
+    if (item.computedPosition === 'fixed') {
+      item.element.style.display = item.originalDisplay || '';
+    } else if (item.computedPosition === 'sticky') {
+      item.element.style.position = item.originalPosition || '';
+    }
   }
 
-  log(`Restored ${hiddenFixedElements.length} fixed elements from display:none`);
+  log(`Restored ${hiddenFixedElements.length} fixed/sticky elements`);
   hiddenFixedElements = [];
 }
 
@@ -1066,7 +1082,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return true;
       }
 
-      selectedElement.scrollTo(scrollX, scrollY);
+      selectedElement.scrollTo({ left: scrollX, top: scrollY, behavior: 'instant' });
 
       // Wait for scroll to settle
       setTimeout(() => {

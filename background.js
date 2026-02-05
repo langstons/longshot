@@ -244,14 +244,14 @@ async function scrollAndStitchCapture(tabId, sessionId) {
 
       captures.push({
         blob,
-        scrollY,
+        scrollY: scrollResult.scrolledToY,  // Use ACTUAL position, not requested
         viewportHeight,
         viewportWidth,
         windowHeight,
         windowWidth,
         containerBounds,
         useCustomContainer,
-        isLastCapture: scrollY + viewportHeight >= scrollHeight
+        isLastCapture: scrollResult.scrolledToY + viewportHeight >= scrollHeight
       });
 
       log(`Capture ${i + 1}: Stored (size: ${blob.size} bytes)`);
@@ -300,16 +300,17 @@ async function scrollAndStitchCapture(tabId, sessionId) {
     // Step 4: Create offscreen document and send for stitching
     await createOffscreenDocument();
 
-    // For full-page capture, we DON'T crop to container bounds
-    // We use the container for scrolling, but capture the full window
-    // Container cropping is only for "center section" captures
+    // If a custom container was detected and used for scrolling, pass its bounds
+    // so the offscreen can crop to the container area for correct stitching.
+    // When scrolling a container, the full-window images only differ in the
+    // container area, so cropping is required for correct overlap calculation.
     const stitchResult = await sendToOffscreen({
       type: 'STITCH_CAPTURES',
       captures: captureDataUrls,
       overlapHeight: OVERLAP_HEIGHT,
       tabUrl: 'page',
-      useCustomContainer: false, // Don't crop for full-page capture
-      containerBounds: null,     // No cropping bounds
+      useCustomContainer: useCustomContainer,
+      containerBounds: containerBounds,
       devicePixelRatio: devicePixelRatio
     });
 

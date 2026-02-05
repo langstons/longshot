@@ -382,43 +382,23 @@ async function stitchCapturedViewports(captures, overlapHeight, useCustomContain
       return await stitchCustomContainerCaptures(images, overlapHeight, containerBounds, devicePixelRatio);
     }
 
-    // Detect sticky header by comparing first two captures
-    let stickyHeaderHeight = 0;
-    if (images.length >= 2) {
-      const firstImg = images[0];
-      const secondImg = images[1];
-      // Compare top 200px to detect sticky headers
-      const maxCompareHeight = Math.min(200, firstImg.img.height / 2);
-      stickyHeaderHeight = detectStickyHeaderHeight(
-        firstImg.img,
-        secondImg.img,
-        0,
-        maxCompareHeight,
-        firstImg.img.width
-      );
-      if (stickyHeaderHeight > 0) {
-        log(`Detected sticky header: ${stickyHeaderHeight}px`);
-      }
-    }
+    // Simple absolute positioning: each capture is drawn at its scroll position.
+    // No overlap calculation needed. Later captures overwrite earlier ones in
+    // overlap regions, which is correct since they show the same page content.
+    // The first capture (with fixed header) is preserved at the top since
+    // subsequent captures start below the header area.
 
-    // Calculate canvas dimensions
     const canvasWidth = images[0].img.width;
-    let totalHeight = images[0].img.height; // First capture is full height
 
-    // Each subsequent capture overlaps by overlapHeight, plus any detected sticky header
-    for (let i = 1; i < images.length; i++) {
-      const newHeight = images[i].img.height - overlapHeight - stickyHeaderHeight;
-      totalHeight += newHeight;
-    }
+    // Total height = last capture's absolute position + its image height
+    const lastImg = images[images.length - 1];
+    const totalHeight = Math.round(lastImg.scrollY * devicePixelRatio) + lastImg.img.height;
 
     log(`Canvas dimensions: ${canvasWidth}x${totalHeight}`);
 
-    // Validate dimensions
     const sanitizedWidth = sanitizeCanvasDimension(canvasWidth, 800);
     const sanitizedHeight = sanitizeCanvasDimension(totalHeight, 600);
 
-    // Create output canvas
-    log('Creating output canvas...');
     const outputCanvas = new OffscreenCanvas(sanitizedWidth, sanitizedHeight);
     const ctx = outputCanvas.getContext('2d');
 
@@ -426,35 +406,20 @@ async function stitchCapturedViewports(captures, overlapHeight, useCustomContain
       throw new Error('Failed to get canvas context');
     }
 
-    // Draw images with overlap and sticky header handling
-    let currentY = 0;
-
+    // Draw each capture at its absolute scroll position (in device pixels)
     for (let i = 0; i < images.length; i++) {
       const image = images[i];
-      const isFirstCapture = i === 0;
+      const destY = Math.round(image.scrollY * devicePixelRatio);
 
-      // For first capture: draw full image
-      // For subsequent captures: skip overlap region AND sticky header (both are duplicates)
-      const sourceY = isFirstCapture ? 0 : overlapHeight + stickyHeaderHeight;
-      const drawHeight = isFirstCapture ? image.img.height : image.img.height - overlapHeight - stickyHeaderHeight;
+      log(`Drawing capture ${i + 1}: destY=${destY}, scrollY=${image.scrollY}, imgSize=${image.img.width}x${image.img.height}`);
 
-      log(`Drawing image ${i + 1} at Y=${currentY}, source Y=${sourceY}, height=${drawHeight}, stickySkip=${isFirstCapture ? 0 : stickyHeaderHeight}px`);
-
-      // Draw the image portion (skip overlap + sticky header for non-first captures)
-      ctx.drawImage(
-        image.img,
-        0, sourceY, canvasWidth, drawHeight,
-        0, currentY, canvasWidth, drawHeight
-      );
-
-      currentY += drawHeight;
+      ctx.drawImage(image.img, 0, destY);
     }
 
     log('Stitching complete, converting to PNG...');
 
-    // Convert to blob
     const blob = await outputCanvas.convertToBlob({ type: 'image/png' });
-    log(`Stitched PNG created: ${blob.size} bytes`);
+    log(`Stitched PNG created: ${blob.size} bytes (${sanitizedWidth}x${sanitizedHeight})`);
 
     return blob;
 
